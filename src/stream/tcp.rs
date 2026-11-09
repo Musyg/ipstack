@@ -773,9 +773,10 @@ async fn tcp_main_logic_loop(
             break;
         }
 
+        if !flags.contains(ACK) {
+            continue;
+        }
         tcb.update_duplicate_ack_count(incoming_ack);
-
-        tcb.update_inflight_packet_queue(incoming_ack);
 
         let pkt_type = tcb.check_pkt_type(tcp_header, &payload);
 
@@ -789,6 +790,8 @@ async fn tcp_main_logic_loop(
         if pkt_type == PacketType::Invalid {
             continue;
         }
+        // An invalid ACK must not remove bytes that still need retransmission.
+        tcb.update_inflight_packet_queue(incoming_ack);
 
         match state {
             TcpState::SynReceived if flags.contains(ACK) => {
@@ -896,7 +899,7 @@ async fn tcp_main_logic_loop(
                 }
                 write_notify.wake();
             }
-            TcpState::LastAck if flags.contains(ACK) => {
+            TcpState::LastAck if flags.contains(ACK) && incoming_ack == tcb.get_seq() => {
                 tcb.change_state(TcpState::Closed);
                 tokio::spawn(async move {
                     if let Err(e) = exit_notifier.send(()).await {
@@ -2488,5 +2491,56 @@ mod tests {
         let packets = written(&mut up_rx).await;
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].payload.as_deref(), Some(&b"early"[..]));
+    }
+
+    fn state_of(stream: &IpStackTcpStream) -> TcpState {
+        stream.tcb.lock().unwrap().get_state()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_ack_must_cover_fin() {
+        let (mut stream, mut rx, seq) = established().await;
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, seq, ACK | FIN, u16::MAX, &[]))
+            .unwrap();
+        written(&mut rx).await;
+        let mut cx = Context::from_waker(Waker::noop());
+        let _ = Pin::new(&mut stream).poll_shutdown(&mut cx);
+        written(&mut rx).await;
+        stream.stream_sender().send(peer_ack(1002, seq)).unwrap();
+        written(&mut rx).await;
+        assert_eq!(state_of(&stream), TcpState::LastAck);
+        stream.stream_sender().send(peer_ack(1002, seq.wrapping_add(1))).unwrap();
+        written(&mut rx).await;
+        assert_eq!(state_of(&stream), TcpState::Closed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_future_ack_does_not_discard_inflight_data() {
+        let (mut stream, mut rx, seq) = established().await;
+        stream.write_all(b"reply").await.unwrap();
+        written(&mut rx).await;
+        stream.stream_sender().send(peer_ack(1001, seq + 6)).unwrap();
+        written(&mut rx).await;
+        let outstanding = stream.tcb.lock().unwrap().get_inflight_packets_total_len();
+        assert_eq!(outstanding, 5);
+        let mut cx = Context::from_waker(Waker::noop());
+        let _ = Pin::new(&mut stream).poll_shutdown(&mut cx);
+        assert!(fins_written(&mut rx).await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn segment_without_ack_cannot_retire_data() {
+        let (mut stream, mut rx, seq) = established().await;
+        stream.write_all(b"reply").await.unwrap();
+        written(&mut rx).await;
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, seq + 5, PSH, u16::MAX, b"ignored"))
+            .unwrap();
+        written(&mut rx).await;
+        let outstanding = stream.tcb.lock().unwrap().get_inflight_packets_total_len();
+        assert_eq!(outstanding, 5);
     }
 }
